@@ -16,7 +16,7 @@ smoothing_window = 5
 
 # Serial communication settings
 ARDUINO_PORT = '/dev/cu.usbmodem14201'  # MacBook Arduino port
-BAUD_RATE = 9600
+BAUD_RATE = 115200
 SEND_INTERVAL = 5  # Send data every 5 frames to avoid overwhelming Arduino
 
 # Initialize serial connection
