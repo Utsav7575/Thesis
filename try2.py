@@ -1,130 +1,139 @@
+"""
+ball_tracker_sender_single_view.py
+
+Single camera view ONLY (for delay checking):
+- Basler camera
+- Normalized coordinates
+- Print every 60 frames
+- One display window
+"""
+
 import cv2
 import numpy as np
 from pypylon import pylon
-from collections import deque
+import struct
 import serial
 import time
 
-# ---------------- Ball Detection Settings ----------------
-lower_color = np.array([0, 0, 200])
-upper_color = np.array([180, 30, 255])
-min_contour_area = 100
-smoothing_window = 3
-
-# ---------------- Serial Settings ----------------
+# ---------- CONFIG ----------
 ARDUINO_PORT = 'COM3'
 BAUD_RATE = 115200
-SEND_INTERVAL = 1
 
-# ---------------- Initialize Serial ----------------
+DESIRED_WIDTH = 580
+DESIRED_HEIGHT = 580
+
+THRESHOLD_VALUE = 100
+MIN_CONTOUR_AREA = 100
+MIN_RADIUS = 6
+MAX_RADIUS = 120
+
+PRINT_EVERY = 60
+# --------------------------------
+
+# ---------- SERIAL ----------
 try:
-    arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)
-    print(f"Connected to Arduino on {ARDUINO_PORT}")
-except serial.SerialException:
-    print(f"Failed to connect to Arduino on {ARDUINO_PORT}")
+    arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0)
+    time.sleep(2.0)
+    arduino.flushInput()
+    arduino.flushOutput()
+except:
     arduino = None
 
-# ---------------- Tracking ----------------
-previous_centers = deque(maxlen=smoothing_window)
-frame_count = 0
-PRINT_INTERVAL = 1  # seconds
-last_print_time = 0
+def send_packet(x, y, detected):
+    if arduino is None:
+        return
+    packet = struct.pack('<ffB', np.float32(x), np.float32(y), detected)
+    arduino.write(packet)
 
-def normalize_coordinates(center, width, height):
-    return center[0]/width, center[1]/height
-
-def center_coordinates(center, width, height):
-    return (center[0]-width/2)/(width/2), (center[1]-height/2)/(height/2)
-
-def smooth_position(center, prev_centers):
-    prev_centers.append(center)
-    return tuple(map(int, np.mean(prev_centers, axis=0)))
-
-def send_to_arduino(x_c, y_c, detected):
-    if arduino and arduino.is_open:
-        message = f"X:{x_c:.3f},Y:{y_c:.3f},D:{1 if detected else 0}\n"
-        arduino.write(message.encode())
-
-# ---------------- Camera ----------------
+# ---------- CAMERA ----------
 tl_factory = pylon.TlFactory.GetInstance()
 devices = tl_factory.EnumerateDevices()
+if not devices:
+    raise RuntimeError("No Basler camera found")
+
 camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
 camera.Open()
-camera.Width.SetValue(1288)
-camera.Height.SetValue(720)
+camera.Width.SetValue(min(camera.Width.GetMax(), 1288))
+camera.Height.SetValue(min(camera.Height.GetMax(), 720))
 camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
 converter = pylon.ImageFormatConverter()
 converter.OutputPixelFormat = pylon.PixelType_BGR8packed
 converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 
-frame_width = camera.Width.Value
-frame_height = camera.Height.Value
-print(f"Camera initialized: {frame_width}x{frame_height}")
+frame_w = camera.Width.Value
+frame_h = camera.Height.Value
 
-desired_width = 580
-desired_height = 580
-
-while camera.IsGrabbing():
-    grab_result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-    if not grab_result.GrabSucceeded():
-        continue
-
-    image = converter.Convert(grab_result)
-    frame = image.GetArray()
-    frame_count += 1
-
-    # Crop center
-    cx, cy = frame_width//2, frame_height//2
-    crop_x1 = max(cx - desired_width//2, 0)
-    crop_x2 = min(cx + desired_width//2, frame_width)
-    crop_y1 = max(cy - desired_height//2, 0)
-    crop_y2 = min(cy + desired_height//2, frame_height)
-    cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-    if cropped.shape[:2] != (desired_height, desired_width):
-        cropped = cv2.resize(cropped, (desired_width, desired_height))
-
-    # Ball detection
-    hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, lower_color, upper_color)
-    mask = cv2.erode(mask, None, iterations=2)
-    mask = cv2.dilate(mask, None, iterations=2)
+# ---------- UTILS ----------
+def detect_ball(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    ball_detected = False
-    center = (0,0)
+    if not contours:
+        return None
 
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) > min_contour_area:
-            M = cv2.moments(largest)
-            if M["m00"] > 0:
-                c = (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
-                center = smooth_position(c, previous_centers)
-                ball_detected = True
-                cv2.circle(cropped, center, 5, (0,0,255), -1)
+    c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) < MIN_CONTOUR_AREA:
+        return None
 
-    x_norm, y_norm = normalize_coordinates(center, desired_width, desired_height)
-    x_centered, y_centered = center_coordinates(center, desired_width, desired_height)
+    ((x, y), r) = cv2.minEnclosingCircle(c)
+    if r < MIN_RADIUS or r > MAX_RADIUS:
+        return None
 
-    send_to_arduino(x_centered, y_centered, ball_detected)
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return None
 
-    # Print only every PRINT_INTERVAL (~2 FPS)
-    current_time = time.time()
-    if current_time - last_print_time > PRINT_INTERVAL:
-        print(f"Frame {frame_count} | Normalized: X={x_norm:.3f}, Y={y_norm:.3f} | "
-              f"Centered: X={x_centered:.3f}, Y={y_centered:.3f} | Ball: {'Yes' if ball_detected else 'No'}")
-        last_print_time = current_time
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    return cx, cy
 
-    cv2.imshow("Cropped Frame", cropped)
-    cv2.imshow("Mask", mask)
-    if cv2.waitKey(1) & 0xFF in [27, ord('q'), ord('Q')]:
-        break
+def normalize(cx, cy, w, h):
+    return (cx - w / 2) / (w / 2), (cy - h / 2) / (h / 2)
 
-    grab_result.Release()
+# ---------- MAIN ----------
+frame_idx = 0
 
-camera.StopGrabbing()
-camera.Close()
-if arduino and arduino.is_open:
-    arduino.close()
-cv2.destroyAllWindows()
+try:
+    while camera.IsGrabbing():
+        grab = camera.RetrieveResult(2000, pylon.TimeoutHandling_ThrowException)
+        frame = converter.Convert(grab).GetArray()
+        grab.Release()
+        frame_idx += 1
+
+        cx, cy = frame_w // 2, frame_h // 2
+        crop = frame[
+            cy - DESIRED_HEIGHT // 2 : cy + DESIRED_HEIGHT // 2,
+            cx - DESIRED_WIDTH // 2  : cx + DESIRED_WIDTH // 2
+        ]
+
+        if crop.shape[:2] != (DESIRED_HEIGHT, DESIRED_WIDTH):
+            crop = cv2.resize(crop, (DESIRED_WIDTH, DESIRED_HEIGHT))
+
+        center = detect_ball(crop)
+
+        if center:
+            x, y = normalize(center[0], center[1],
+                             DESIRED_WIDTH, DESIRED_HEIGHT)
+            send_packet(x, y, 1)
+            cv2.circle(crop, center, 6, (0, 255, 0), -1)
+
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] x={x:+.3f}, y={y:+.3f}")
+        else:
+            send_packet(0.0, 0.0, 0)
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] Ball NOT detected")
+
+        cv2.imshow("Camera View (Latency Check)", crop)
+        if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+            break
+
+finally:
+    camera.StopGrabbing()
+    camera.Close()
+    if arduino and arduino.is_open:
+        arduino.close()
+    cv2.destroyAllWindows()

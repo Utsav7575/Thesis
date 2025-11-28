@@ -1,198 +1,234 @@
+"""
+ball_tracker_sender.py
+Optimized vision + sender:
+- Basler pylon camera
+- MOSSE tracker with periodic full-detection reinit
+- Kalman filter (x,y,vx,vy)
+- Predicts forward by measured latency + extra margin
+- Sends binary packets: <float32 x_centered, float32 y_centered, uint8 detected>
+"""
+
 import cv2
 import numpy as np
 from pypylon import pylon
-from collections import deque
+import struct
 import serial
 import time
+from collections import deque
 
-# Ball detection settings
-lower_color = np.array([0, 0, 200])  # Lower bound for off-white (light)
-upper_color = np.array([180, 30, 255])  # Upper bound for off-white (bright)
-min_radius = 10  # Minimum radius of the ball
-max_radius = 30# Maximum radius of the ball (adjust this as needed)
-min_contour_area = 100
-max_lost_frames = 10
-smoothing_window = 5
+# ---------- CONFIG ----------
+ARDUINO_PORT = 'COM3'       # <-- set your Arduino port (Windows COMx or /dev/ttyUSBx)
+BAUD_RATE = 115200          # must match Arduino
+DESIRED_WIDTH = 580
+DESIRED_HEIGHT = 580
+DETECT_EVERY = 18           # full detection every N frames
+THRESHOLD_VALUE = 100       # brightness threshold (0-255) - tune for your ball/lights
+MIN_CONTOUR_AREA = 100
+MIN_RADIUS = 6
+MAX_RADIUS = 120
+ARDUINO_EXTRA_LATENCY = 0.02  # seconds to account for Arduino processing & actuation
+PROCESS_TIME_WINDOW = 20
+SERIAL_TIME_WINDOW = 50
+PRINT_EVERY = 60           # print coordinates every N frames
+# --------------------------------
 
-# Serial communication settings
-ARDUINO_PORT = '/dev/cu.usbmodem14201'  # MacBook Arduino port
-BAUD_RATE = 115200
-SEND_INTERVAL = 5  # Send data every 5 frames to avoid overwhelming Arduino
-
-# Initialize serial connection
+# Serial init
 try:
-    arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)  # Give Arduino time to initialize
-    print(f"Connected to Arduino on {ARDUINO_PORT}")
-except serial.SerialException:
-    print(f"Failed to connect to Arduino on {ARDUINO_PORT}")
+    arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.001)
+    time.sleep(2.0)  # allow Arduino reset
+    arduino.flushInput()
+    arduino.flushOutput()
+    print(f"[PY] Serial open {ARDUINO_PORT} @ {BAUD_RATE}")
+except Exception as e:
     arduino = None
+    print(f"[PY] Warning: serial open failed: {e}")
 
-# Initialize tracking variables
-previous_centers = deque(maxlen=smoothing_window)
-ball_lost_counter = 0
-frame_count = 0
-
-def normalize_coordinates(center, frame_width, frame_height):
-    """Convert pixel coordinates to normalized coordinates (0.0 to 1.0)"""
-    x_norm = center[0] / frame_width
-    y_norm = center[1] / frame_height
-    return x_norm, y_norm
-
-def center_coordinates(center, frame_width, frame_height):
-    """Convert pixel coordinates to centered coordinates (-1.0 to 1.0)"""
-    x_centered = (center[0] - frame_width / 2) / (frame_width / 2)
-    y_centered = (center[1] - frame_height / 2) / (frame_height / 2)
-    return x_centered, y_centered
-
-def smooth_position(center, previous_centers):
-    """Apply moving average smoothing to ball position"""
-    if len(previous_centers) > 0:
-        previous_centers.append(center)
-        smooth_center = tuple(map(int, np.mean(previous_centers, axis=0)))
-        return smooth_center
-    return center
-
-def send_to_arduino(x_centered, y_centered, ball_detected):
-    """Send ball coordinates to Arduino via serial"""
-    if arduino and arduino.is_open:
-        try:
-            # Format: "X:0.123,Y:-0.456,D:1\n" where D is ball detected (1) or lost (0)
-            message = f"X:{x_centered:.3f},Y:{y_centered:.3f},D:{1 if ball_detected else 0}\n"
-            arduino.write(message.encode())
-            
-            # Optional: Read response from Arduino
-            if arduino.in_waiting > 0:
-                response = arduino.readline().decode().strip()
-                if response:
-                    print(f"Arduino response: {response}")
-                    
-        except Exception as e:
-            print(f"Error sending to Arduino: {e}")
-
-def send_to_controller(center_x, center_y, ball_detected, frame_count):
-    """Display tracking info and send to Arduino"""
-    if frame_count % 30 == 0:  # Print every 30 frames
-        if ball_detected:
-            print(f"Frame {frame_count:4d} | Controller: X={center_x:6.3f}, Y={center_y:6.3f} | Ball: DETECTED")
-        else:
-            print(f"Frame {frame_count:4d} | Controller: X={0.000:6.3f}, Y={0.000:6.3f} | Ball: LOST")
-    
-    # Send to Arduino every SEND_INTERVAL frames
-    if frame_count % SEND_INTERVAL == 0:
-        send_to_arduino(center_x, center_y, ball_detected)
-
-# Initialize Basler camera
+# Basler camera init
 tl_factory = pylon.TlFactory.GetInstance()
 devices = tl_factory.EnumerateDevices()
+if len(devices) == 0:
+    raise RuntimeError("No Basler camera found")
 camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
 camera.Open()
-
-# Set the camera resolution to the desired values (within supported range)
-camera.Width.SetValue(1288)  # Maximum width supported by your camera
-camera.Height.SetValue(720)  # Set an appropriate height (within the camera's range)
-
-# Start grabbing frames with the full resolution
+# choose supported resolution or camera defaults
+camera.Width.SetValue(min(camera.Width.GetMax(), 1288))
+camera.Height.SetValue(min(camera.Height.GetMax(), 720))
 camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 converter = pylon.ImageFormatConverter()
 converter.OutputPixelFormat = pylon.PixelType_BGR8packed
 converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+frame_w = camera.Width.Value
+frame_h = camera.Height.Value
+print(f"[PY] Camera initialized {frame_w}x{frame_h}")
 
-# Get the original frame dimensions
-frame_width = camera.Width.Value
-frame_height = camera.Height.Value
+# Kalman setup: state [x, y, vx, vy], measurement [x, y]
+kf = cv2.KalmanFilter(4, 2)
+kf.transitionMatrix = np.array([[1,0,1,0],
+                                [0,1,0,1],
+                                [0,0,1,0],
+                                [0,0,0,1]], dtype=np.float32)
+kf.measurementMatrix = np.array([[1,0,0,0],
+                                 [0,1,0,0]], dtype=np.float32)
+kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-3
+kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+kf.errorCovPost = np.eye(4, dtype=np.float32)
 
-print(f"Camera initialized with resolution: {frame_width}x{frame_height}")
-print("Press 'Q', 'q', or Escape to quit")
+# Tracker state
+tracker = None
+tracker_initialized = False
+frame_idx = 0
 
-# Define desired frame size (this is the cropped size you want)
-desired_width = 580
-desired_height = 580
+# timing stats
+proc_times = deque(maxlen=PROCESS_TIME_WINDOW)
+serial_times = deque(maxlen=SERIAL_TIME_WINDOW)
 
-while camera.IsGrabbing():
-    grab_result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-    if grab_result.GrabSucceeded():
-        image = converter.Convert(grab_result)
-        frame = image.GetArray()
-        frame_count += 1
+def detect_ball(crop):
+    # convert to grayscale for brightness detection
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # binary threshold: white ball = high values, dark plate = low values
+    _, mask = cv2.threshold(blurred, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    # clean up mask
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=2)
+    # find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, mask
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    if area < MIN_CONTOUR_AREA:
+        return None, mask
+    ((x,y), r) = cv2.minEnclosingCircle(largest)
+    M = cv2.moments(largest)
+    if M['m00'] == 0:
+        return None, mask
+    cx = int(M['m10']/M['m00'])
+    cy = int(M['m01']/M['m00'])
+    if r < MIN_RADIUS or r > MAX_RADIUS:
+        return None, mask
+    return ((cx, cy), int(r)), mask
 
-        # Calculate cropping coordinates for the center
-        center_x, center_y = frame_width // 2, frame_height // 2
+def center_coords_to_normalized(center, w, h):
+    # convert pixel center (0..w-1,0..h-1) -> centered coords (-1..1)
+    x_c = (center[0] - w/2) / (w/2)
+    y_c = (center[1] - h/2) / (h/2)
+    return float(x_c), float(y_c)
 
-        # Ensure the cropping window fits inside the frame
-        crop_x1 = max(center_x - desired_width // 2, 0)
-        crop_x2 = min(center_x + desired_width // 2, frame_width)
-        crop_y1 = max(center_y - desired_height // 2, 0)
-        crop_y2 = min(center_y + desired_height // 2, frame_height)
+def send_packet(xc, yc, detected):
+    if arduino is None:
+        return
+    # pack little-endian float32, float32, uint8
+    packet = struct.pack('<ffB', np.float32(xc), np.float32(yc), 1 if detected else 0)
+    t0 = time.perf_counter()
+    try:
+        arduino.write(packet)
+    except Exception as e:
+        print(f"[PY] Serial write error: {e}")
+    serial_times.append(time.perf_counter() - t0)
 
-        # Crop the center region
-        cropped_frame = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+try:
+    while camera.IsGrabbing():
+        t0 = time.perf_counter()
+        grab = camera.RetrieveResult(3000, pylon.TimeoutHandling_ThrowException)
+        if not grab.GrabSucceeded():
+            grab.Release()
+            continue
+        img = converter.Convert(grab)
+        frame = img.GetArray()
+        grab.Release()
+        frame_idx += 1
 
-        # Optionally resize the cropped frame if needed (e.g., if it’s slightly smaller than desired size)
-        if cropped_frame.shape[0] != desired_height or cropped_frame.shape[1] != desired_width:
-            cropped_frame = cv2.resize(cropped_frame, (desired_width, desired_height))
+        # crop center ROI
+        cx, cy = frame_w//2, frame_h//2
+        x1 = max(cx - DESIRED_WIDTH//2, 0)
+        x2 = min(cx + DESIRED_WIDTH//2, frame_w)
+        y1 = max(cy - DESIRED_HEIGHT//2, 0)
+        y2 = min(cy + DESIRED_HEIGHT//2, frame_h)
+        cropped = frame[y1:y2, x1:x2]
+        if cropped.shape[0] != DESIRED_HEIGHT or cropped.shape[1] != DESIRED_WIDTH:
+            cropped = cv2.resize(cropped, (DESIRED_WIDTH, DESIRED_HEIGHT))
 
-        # Convert to HSV color space
-        hsv = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, lower_color, upper_color)
-        mask = cv2.erode(mask, None, iterations=2)
-        mask = cv2.dilate(mask, None, iterations=2)
-        contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        ball_detected = False
         center = None
         radius = 0
+        mask = np.zeros((DESIRED_HEIGHT, DESIRED_WIDTH), dtype=np.uint8)
 
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            contour_area = cv2.contourArea(largest)
+        # Re-detect periodically or if tracker lost
+        if (frame_idx % DETECT_EVERY == 0) or (not tracker_initialized):
+            det, mask = detect_ball(cropped)
+            if det is not None:
+                center, radius = det
+                # initialize Kalman
+                kf.statePre = np.array([[center[0]],[center[1]],[0.],[0.]], dtype=np.float32)
+                kf.statePost = kf.statePre.copy()
+                # init tracker from bbox
+                try:
+                    tracker = cv2.TrackerMOSSE_create()
+                    bbox = (center[0]-radius, center[1]-radius, radius*2, radius*2)
+                    tracker.init(cropped, bbox)
+                    tracker_initialized = True
+                except Exception:
+                    tracker_initialized = False
+        else:
+            if tracker_initialized and tracker is not None:
+                ok, bbox = tracker.update(cropped)
+                if ok:
+                    x, y, w, h = bbox
+                    center = (int(x + w/2), int(y + h/2))
+                    radius = int(max(w,h)/2)
+                else:
+                    tracker_initialized = False
 
-            if contour_area > min_contour_area:
-                ((x, y), radius) = cv2.minEnclosingCircle(largest)
-                M = cv2.moments(largest)
+        proc_times.append(time.perf_counter() - t0)
 
-                if M["m00"] > 0 and min_radius <= radius <= max_radius:  # Check both min and max radius
-                    center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-                    if len(previous_centers) > 0:
-                        center = smooth_position(center, previous_centers)
-                    else:
-                        previous_centers.append(center)
+        if center is not None:
+            meas = np.array([[np.float32(center[0])],[np.float32(center[1])]])
+            kf.correct(meas)
+            pred = kf.predict()
+            px, py, vx, vy = float(pred[0]), float(pred[1]), float(pred[2]), float(pred[3])
 
-                    ball_detected = True
-                    ball_lost_counter = 0
+            avg_proc = float(np.mean(proc_times)) if len(proc_times)>0 else 0.02
+            avg_serial = float(np.mean(serial_times)) if len(serial_times)>0 else 0.002
+            tau = avg_proc + avg_serial + ARDUINO_EXTRA_LATENCY
 
-                    # Draw the ball on the frame
-                    cv2.circle(cropped_frame, (int(x), int(y)), int(radius), (0, 255, 0), 2)
-                    cv2.circle(cropped_frame, center, 5, (0, 0, 255), -1)
+            x_pred = px + vx * tau
+            y_pred = py + vy * tau
 
-                    # Calculate normalized and centered coordinates
-                    x_norm, y_norm = normalize_coordinates(center, desired_width, desired_height)
-                    x_centered, y_centered = center_coordinates(center, desired_width, desired_height)
+            # clamp
+            x_pred = max(0.0, min(DESIRED_WIDTH-1, x_pred))
+            y_pred = max(0.0, min(DESIRED_HEIGHT-1, y_pred))
 
-                    send_to_controller(x_centered, y_centered, True, frame_count)
+            x_centered, y_centered = center_coords_to_normalized((x_pred, y_pred), DESIRED_WIDTH, DESIRED_HEIGHT)
 
-        if not ball_detected:
-            ball_lost_counter += 1
-            if ball_lost_counter > max_lost_frames:
-                previous_centers.clear()
-            send_to_controller(0.0, 0.0, False, frame_count)
+            send_packet(x_centered, y_centered, True)
 
-        # Show the cropped frame and the mask
-        cv2.imshow("Cropped Frame", cropped_frame)
-        cv2.imshow("Detection Mask", mask)
+            # print coordinates every PRINT_EVERY frames
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] Detected: x={x_centered:+.3f}, y={y_centered:+.3f})")
 
+            # draw markers
+            cv2.circle(cropped, (int(px), int(py)), max(2, int(radius)), (0,255,0), 2)
+            cv2.circle(cropped, (int(x_pred), int(y_pred)), 4, (255,0,0), -1)
+            cv2.putText(cropped, f"{x_centered:+.3f},{y_centered:+.3f}", (8,18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        else:
+            send_packet(0.0, 0.0, False)
+            # print when ball is lost
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] Ball NOT detected")
+
+        # show
+        cv2.imshow("Cropped", cropped)
+        cv2.imshow("Mask", mask)
         key = cv2.waitKey(1) & 0xFF
-        if key in [ord('q'), ord('Q'), 27]:
+        if key in (ord('q'), ord('Q'), 27):
             break
 
-        grab_result.Release()
-
-# Cleanup
-camera.StopGrabbing()
-camera.Close()
-if arduino and arduino.is_open:
-    arduino.close()
-    print("Arduino connection closed")
-cv2.destroyAllWindows()
-print("\nBall tracking system stopped.")
-print(f"Total frames processed: {frame_count}")
+finally:
+    camera.StopGrabbing()
+    camera.Close()
+    if arduino is not None and arduino.is_open:
+        arduino.close()
+    cv2.destroyAllWindows()
+    print("[PY] Exiting")

@@ -8,8 +8,8 @@ import time
 # Ball detection settings
 lower_color = np.array([0, 0, 200])  # Lower bound for off-white (light)
 upper_color = np.array([180, 30, 255])  # Upper bound for off-white (bright)
-min_radius = 20  # Minimum radius of the ball
-max_radius = 50 # Maximum radius of the ball (adjust this as needed)
+min_radius = 10  # Minimum radius of the ball
+max_radius = 50 # Maximum radius of the ball
 min_contour_area = 100
 max_lost_frames = 10
 smoothing_window = 5
@@ -54,21 +54,16 @@ def smooth_position(center, previous_centers):
     return center
 
 def send_to_arduino(x_centered, y_centered, ball_detected):
-    """Send ball coordinates to Arduino via serial"""
+    """Send ball coordinates to Arduino via 9-byte binary packet"""
     if arduino and arduino.is_open:
         try:
-            # Format: "X:0.123,Y:-0.456,D:1\n" where D is ball detected (1) or lost (0)
-            message = f"X:{x_centered:.3f},Y:{y_centered:.3f},D:{1 if ball_detected else 0}\n"
-            arduino.write(message.encode())
-            
-            # Optional: Read response from Arduino
-            if arduino.in_waiting > 0:
-                response = arduino.readline().decode().strip()
-                if response:
-                    print(f"Arduino response: {response}")
-                    
+            import struct
+            # Pack floats as 4 bytes each + 1 byte for detected flag
+            message = struct.pack('<ffB', x_centered, y_centered, 1 if ball_detected else 0)
+            arduino.write(message)
         except Exception as e:
             print(f"Error sending to Arduino: {e}")
+
 
 def send_to_controller(center_x, center_y, ball_detected, frame_count):
     """Display tracking info and send to Arduino"""
@@ -89,7 +84,7 @@ camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
 camera.Open()
 
 # Set the camera resolution to the desired values (within supported range)
-camera.Width.SetValue(1288)  # Maximum width supported by your camera
+camera.Width.SetValue(1288)  # Maximum width supported by camera
 camera.Height.SetValue(720)  # Set an appropriate height (within the camera's range)
 
 # Start grabbing frames with the full resolution
@@ -105,7 +100,7 @@ frame_height = camera.Height.Value
 print(f"Camera initialized with resolution: {frame_width}x{frame_height}")
 print("Press 'Q', 'q', or Escape to quit")
 
-# Define desired frame size (this is the cropped size you want)
+# Define desired frame size (this is the cropped size we want)
 desired_width = 580
 desired_height = 580
 
