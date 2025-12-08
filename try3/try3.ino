@@ -1,38 +1,38 @@
 #include <Servo.h>
 
-// ---------- CONFIG / TUNABLE PARAMETERS ----------
-const int MOTOR_X_PIN = 9;
-const int MOTOR_Y_PIN = 10;
-const int LED_PIN = 13;
+// ---------------- CONFIGURATION AND TUNABLE PARAMETERS ----------------
+const int MOTOR_X_PIN = 9;       // Pin for X-axis servo
+const int MOTOR_Y_PIN = 10;      // Pin for Y-axis servo
+const int LED_PIN = 13;          // Onboard LED for debug/status
 
 // Servo neutral (center) positions
-int SERVO_X_OFFSET = 90;
-int SERVO_Y_OFFSET = 90;
+const int SERVO_X_OFFSET = 90;
+const int SERVO_Y_OFFSET = 90;
 
 // Servo limits
 const int SERVO_MIN = 45;
 const int SERVO_MAX = 135;
 
-// PID gains
-float kP_x = 14.0;   // proportional gain X
-float kI_x = 0.05;   // integral gain X
-float kD_x = 200.0;   // derivative gain X
+// PID gains for X and Y axes
+const float kP_x = 14.0;   // Proportional gain X
+const float kI_x = 0.05;   // Integral gain X
+const float kD_x = 200.0;  // Derivative gain X
 
-float kP_y = 14.0;   // proportional gain Y
-float kI_y = 0.05;   // integral gain Y
-float kD_y = 200.0;   // derivative gain Y
+const float kP_y = 14.0;   // Proportional gain Y
+const float kI_y = 0.05;   // Integral gain Y
+const float kD_y = 200.0;  // Derivative gain Y
 
-// Ignore small errors
-float deadzone = 0.01;
+// Ignore small errors to prevent jitter
+const float deadzone = 0.01;
 
-// Maximum servo change per update
+// Maximum servo movement per update for smooth motion
 const int MAX_SERVO_CHANGE = 4;
 
-// Timing
-const unsigned long UPDATE_INTERVAL = 20;       // ms
-const unsigned long MESSAGE_TIMEOUT = 2000;     // ms
+// Timing intervals (microseconds)
+const unsigned long UPDATE_INTERVAL_US = 20000;     // 20 ms per PID loop
+const unsigned long MESSAGE_TIMEOUT_US = 2000000;   // 2000 ms for ball lost
 
-// ------------------------------------------------
+// -----------------------------------------------------------------------
 
 Servo servoX;
 Servo servoY;
@@ -44,22 +44,23 @@ float integral_x = 0, integral_y = 0;
 float derivative_x = 0, derivative_y = 0;
 float output_x = 0, output_y = 0;
 
-// Ball coordinates from Python
+// Ball coordinates received from Python
 float ball_x = 0.0;
 float ball_y = 0.0;
 bool ball_detected = false;
 
+// Timing variables (using micros() for precise non-blocking control)
 unsigned long last_message = 0;
 unsigned long last_update = 0;
 unsigned long last_debug = 0;
 
 void setup() {
-  Serial.begin(115200);
-  servoX.attach(MOTOR_X_PIN);
+  Serial.begin(115200);       // Initialize serial communication
+  servoX.attach(MOTOR_X_PIN); // Attach servos to pins
   servoY.attach(MOTOR_Y_PIN);
   pinMode(LED_PIN, OUTPUT);
 
-  // Initialize servos to center
+  // Initialize servos to neutral positions
   servoX.write(SERVO_X_OFFSET);
   servoY.write(SERVO_Y_OFFSET);
 
@@ -67,49 +68,59 @@ void setup() {
 }
 
 void loop() {
-  // --- Read exact 9-byte packet from Python ---
-  if (Serial.available() >= 9) {
+  readSerialPacket();    // Read coordinates from Python (non-blocking)
+  checkTimeout();        // Handle lost ball scenario
+  runControlLoop();      // Run PID control and move servos
+}
+
+// ---------------------- READ SERIAL ----------------------
+// Non-blocking read of 9-byte packet (float x, float y, detected flag)
+void readSerialPacket() {
+  while (Serial.available() >= 9) {
     byte buffer[9];
     Serial.readBytes(buffer, 9);
 
-    memcpy(&ball_x, buffer, 4);        // float X from Python
-    memcpy(&ball_y, buffer + 4, 4);    // float Y from Python
-    ball_detected = buffer[8] == 1;    // detected flag
+    memcpy(&ball_x, buffer, 4);        // Copy X coordinate
+    memcpy(&ball_y, buffer + 4, 4);    // Copy Y coordinate
+    ball_detected = buffer[8] == 1;    // Detection flag
 
-    last_message = millis();
+    last_message = micros();           // Update last received time
 
+    // Blink LED for visual feedback (instant, non-blocking)
     digitalWrite(LED_PIN, HIGH);
-    delay(5);
     digitalWrite(LED_PIN, LOW);
 
-    if (millis() - last_debug > 600) {
+    // Optional debug prints every 600 ms
+    if (micros() - last_debug > 600000) {
       Serial.print("X: "); Serial.print(ball_x, 3);
       Serial.print("  Y: "); Serial.print(ball_y, 3);
       Serial.print("  D: "); Serial.println(ball_detected ? "1" : "0");
-      last_debug = millis();
+      last_debug = micros();
     }
-  }
-
-  // --- Ball lost: timeout handling ---
-  if (millis() - last_message > MESSAGE_TIMEOUT) {
-    ball_detected = false;
-  }
-
-  // --- Update servo movement ---
-  if (millis() - last_update >= UPDATE_INTERVAL) {
-    updateServoControl();
-    last_update = millis();
   }
 }
 
-void updateServoControl() {
+// ---------------------- BALL LOST HANDLING ----------------------
+void checkTimeout() {
+  if (micros() - last_message > MESSAGE_TIMEOUT_US) {
+    ball_detected = false; // Mark ball as lost if no data received
+  }
+}
+
+// ---------------------- PID AND SERVO CONTROL ----------------------
+void runControlLoop() {
+  unsigned long now = micros();
+  if (now - last_update < UPDATE_INTERVAL_US) return; // Wait until next PID cycle
+  last_update = now;
+
+  // Current servo positions and last written values
   static int current_x = SERVO_X_OFFSET;
   static int current_y = SERVO_Y_OFFSET;
   static int last_servo_x = SERVO_X_OFFSET;
   static int last_servo_y = SERVO_Y_OFFSET;
 
-  // --- No ball detected → return to center gradually ---
   if (!ball_detected) {
+    // Gradually return servos to center if ball not detected
     if (current_x < SERVO_X_OFFSET) current_x++;
     else if (current_x > SERVO_X_OFFSET) current_x--;
 
@@ -119,14 +130,15 @@ void updateServoControl() {
     servoX.write(current_x);
     servoY.write(current_y);
 
+    // Reset PID variables
     integral_x = integral_y = 0;
     last_error_x = last_error_y = 0;
     derivative_x = derivative_y = 0;
     return;
   }
 
-  // --- PID calculations ---
-  error_x = -ball_x * 1.2;  // adjust sign if needed
+  // ---------------- PID CALCULATION ----------------
+  error_x = -ball_x * 1.2; // Scale and flip sign if needed
   error_y = ball_y * 1.2;
 
   if (abs(error_x) < deadzone) error_x = 0;
@@ -145,7 +157,7 @@ void updateServoControl() {
   integral_x = constrain(integral_x, -50, 50);
   integral_y = constrain(integral_y, -50, 50);
 
-  // Calculate servo angles and clamp to limits
+  // Calculate new servo angles and clamp to servo limits
   int servo_x = SERVO_X_OFFSET + constrain(output_x,
                     -(SERVO_X_OFFSET - SERVO_MIN),
                      (SERVO_MAX - SERVO_X_OFFSET));
@@ -153,7 +165,7 @@ void updateServoControl() {
                     -(SERVO_Y_OFFSET - SERVO_MIN),
                      (SERVO_MAX - SERVO_Y_OFFSET));
 
-  // Rate limiting for smooth motion
+  // Smooth motion by limiting per-step change
   servo_x = constrain(servo_x, last_servo_x - MAX_SERVO_CHANGE, last_servo_x + MAX_SERVO_CHANGE);
   servo_y = constrain(servo_y, last_servo_y - MAX_SERVO_CHANGE, last_servo_y + MAX_SERVO_CHANGE);
 
@@ -161,7 +173,7 @@ void updateServoControl() {
   servoX.write(servo_x);
   servoY.write(servo_y);
 
-  // Update state
+  // Update internal state
   current_x = servo_x;
   current_y = servo_y;
   last_servo_x = servo_x;

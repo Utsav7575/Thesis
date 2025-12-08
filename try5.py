@@ -91,6 +91,8 @@ def normalize(cx, cy, w, h):
 
 # ---------- MAIN ----------
 frame_idx = 0  # Frame counter
+fps_start = time.time()  # Start time for FPS calculation
+fps_counter = 0  # Frame counter for FPS
 
 try:
     while camera.IsGrabbing():
@@ -98,6 +100,7 @@ try:
         frame = converter.Convert(grab).GetArray()  # Convert to OpenCV format
         grab.Release()
         frame_idx += 1
+        fps_counter += 1
 
         # Crop center region
         cx, cy = frame_w // 2, frame_h // 2
@@ -105,7 +108,6 @@ try:
             cy - DESIRED_HEIGHT // 2 : cy + DESIRED_HEIGHT // 2,
             cx - DESIRED_WIDTH // 2  : cx + DESIRED_WIDTH // 2
         ]
-
         # Resize if crop dimensions are off
         if crop.shape[:2] != (DESIRED_HEIGHT, DESIRED_WIDTH):
             crop = cv2.resize(crop, (DESIRED_WIDTH, DESIRED_HEIGHT))
@@ -113,21 +115,34 @@ try:
         center = detect_ball(crop)  # Detect ball
 
         if center:
-            x, y = normalize(center[0], center[1],
-                             DESIRED_WIDTH, DESIRED_HEIGHT)  # Normalize
+            x, y = normalize(center[0], center[1], DESIRED_WIDTH, DESIRED_HEIGHT)
             send_packet(x, y, 1)  # Send to Arduino
             cv2.circle(crop, center, 6, (0, 255, 0), -1)  # Draw detection circle
-
-            if frame_idx % PRINT_EVERY == 0:
-                print(f"[Frame {frame_idx}] x={x:+.3f}, y={y:+.3f}")  # Print info
         else:
-            send_packet(0.0, 0.0, 0)  # No ball detected
-            if frame_idx % PRINT_EVERY == 0:
-                print(f"[Frame {frame_idx}] Ball NOT detected")
+            x, y = 0.0, 0.0
+            send_packet(x, y, 0)  # No ball detected
 
-        cv2.imshow("Camera View (Latency Check)", crop)  # Show crop
+        # Overlay coordinates on image (top-left)
+        coord_text = f"X: {x:.3f} Y: {y:.3f}" if center else "Ball NOT detected"
+        cv2.putText(crop, coord_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 255), 2)
+
+        # Calculate and overlay FPS
+        elapsed = time.time() - fps_start
+        fps = fps_counter / elapsed if elapsed > 0 else 0.0
+        cv2.putText(crop, f"FPS: {fps:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 0, 0), 2)
+
+        cv2.imshow("Camera View (Latency & Coordinates)", crop)  # Show crop
         if cv2.waitKey(1) & 0xFF in (27, ord('q')):  # Exit on ESC or 'q'
             break
+
+        # Print stats every PRINT_EVERY frames
+        if frame_idx % PRINT_EVERY == 0:
+            print(f"[Frame {frame_idx}] FPS: {fps:.2f}, Ball: {'Yes' if center else 'No'}, "
+                  f"X: {x if center else 0:.3f}, Y: {y if center else 0:.3f}")
+            fps_start = time.time()  # Reset FPS timer
+            fps_counter = 0  # Reset FPS counter
 
 finally:
     camera.StopGrabbing()
