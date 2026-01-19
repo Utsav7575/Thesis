@@ -17,12 +17,12 @@ import time
 from collections import deque
 
 # ---------- CONFIG ----------
-ARDUINO_PORT = 'COM3'       # <-- set your Arduino port (Windows COMx or /dev/ttyUSBx)
+ARDUINO_PORT = 'COM3'       # <-- set Arduino port (Windows COM3 or /dev/ttyUSBx)
 BAUD_RATE = 115200          # must match Arduino
 DESIRED_WIDTH = 580
 DESIRED_HEIGHT = 580
 DETECT_EVERY = 18           # full detection every N frames
-THRESHOLD_VALUE = 100       # brightness threshold (0-255) - tune for your ball/lights
+THRESHOLD_VALUE = 100       # brightness threshold (0-255) - tune for ball/lights
 MIN_CONTOUR_AREA = 100
 MIN_RADIUS = 6
 MAX_RADIUS = 120

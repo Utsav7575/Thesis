@@ -4,6 +4,7 @@ from pypylon import pylon
 import struct
 import serial
 import time
+import csv
 
 # ---------- CONFIG ----------
 ARDUINO_PORT = 'COM3'  # Arduino serial port
@@ -89,6 +90,13 @@ def normalize(cx, cy, w, h):
     # Normalize coordinates to [-1, 1]
     return (cx - w / 2) / (w / 2), (cy - h / 2) / (h / 2)
 
+
+log_file = open("log_simple.csv", "w", newline="")   # for simple code
+
+writer = csv.writer(log_file)
+writer.writerow(["time", "x", "y", "detected"])
+
+
 # ---------- MAIN ----------
 frame_idx = 0  # Frame counter
 
@@ -125,6 +133,9 @@ try:
             if frame_idx % PRINT_EVERY == 0:
                 print(f"[Frame {frame_idx}] Ball NOT detected")
 
+        writer.writerow([time.time(), x, y, 1])
+        writer.writerow([time.time(), 0.0, 0.0, 0])
+
         cv2.imshow("Camera View (Latency Check)", crop)  # Show crop
         if cv2.waitKey(1) & 0xFF in (27, ord('q')):  # Exit on ESC or 'q'
             break
@@ -135,3 +146,4 @@ finally:
     if arduino and arduino.is_open:
         arduino.close()
     cv2.destroyAllWindows()  # Close OpenCV windows
+    log_file.close()

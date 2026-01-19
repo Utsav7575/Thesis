@@ -16,6 +16,7 @@ import struct
 import serial
 import time
 from collections import deque
+import csv
 
 # ---------- CONFIG ----------
 ARDUINO_PORT = 'COM3'       # Arduino port
@@ -122,6 +123,13 @@ def send_packet(xc,yc,detected):
         print(f"[THESIS] Serial write error: {e}")
     serial_times.append(time.perf_counter()-t0)
 
+
+log_file = open("log_kalman.csv", "w", newline="") # for kalman code
+
+writer = csv.writer(log_file)
+writer.writerow(["time", "x", "y", "detected"])
+
+
 # ---------- MAIN LOOP ----------
 fps_start = time.time()
 while camera.IsGrabbing():
@@ -188,6 +196,10 @@ while camera.IsGrabbing():
 
         x_centered,y_centered = center_coords_to_normalized((x_pred,y_pred),DESIRED_WIDTH,DESIRED_HEIGHT)
         send_packet(x_centered,y_centered,True)
+        
+        writer.writerow([time.time(), x_centered, y_centered, 1])
+        writer.writerow([time.time(), 0.0, 0.0, 0])
+
 
         # draw ball and center dot
         display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
@@ -219,3 +231,4 @@ camera.Close()
 if arduino is not None and arduino.is_open: arduino.close()
 cv2.destroyAllWindows()
 print("[PY] Exiting")
+log_file.close()
