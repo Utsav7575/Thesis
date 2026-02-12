@@ -4,6 +4,8 @@ from pypylon import pylon
 import struct
 import serial
 import time
+import csv
+from datetime import datetime
 
 # ---------- CONFIG ----------
 ARDUINO_PORT = 'COM3'  # Arduino serial port
@@ -59,10 +61,17 @@ frame_h = camera.Height.Value  # Camera frame height
 def detect_ball(img):
     # Convert image to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
     # Apply Gaussian blur
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
     # Threshold the image to get binary mask
     _, mask = cv2.threshold(blur, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+
+    # Same cleanup logic as code 1 (improves detection stability)
+    mask = cv2.erode(mask, None, 1)
+    mask = cv2.dilate(mask, None, 2)
+
     # Find contours
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -85,14 +94,18 @@ def detect_ball(img):
     cy = int(M["m01"] / M["m00"])  # Centroid y
     return cx, cy
 
+
 def normalize(cx, cy, w, h):
     # Normalize coordinates to [-1, 1]
     return (cx - w / 2) / (w / 2), (cy - h / 2) / (h / 2)
 
+
+log_file = open("ball_tracker_simple.csv", "w", newline="")
+writer = csv.writer(log_file)
+writer.writerow(["timestamp", "x_norm", "y_norm", "detected"])
+
 # ---------- MAIN ----------
 frame_idx = 0  # Frame counter
-fps_start = time.time()  # Start time for FPS calculation
-fps_counter = 0  # Frame counter for FPS
 
 try:
     while camera.IsGrabbing():
@@ -100,7 +113,6 @@ try:
         frame = converter.Convert(grab).GetArray()  # Convert to OpenCV format
         grab.Release()
         frame_idx += 1
-        fps_counter += 1
 
         # Crop center region
         cx, cy = frame_w // 2, frame_h // 2
@@ -108,6 +120,7 @@ try:
             cy - DESIRED_HEIGHT // 2 : cy + DESIRED_HEIGHT // 2,
             cx - DESIRED_WIDTH // 2  : cx + DESIRED_WIDTH // 2
         ]
+
         # Resize if crop dimensions are off
         if crop.shape[:2] != (DESIRED_HEIGHT, DESIRED_WIDTH):
             crop = cv2.resize(crop, (DESIRED_WIDTH, DESIRED_HEIGHT))
@@ -115,34 +128,46 @@ try:
         center = detect_ball(crop)  # Detect ball
 
         if center:
-            x, y = normalize(center[0], center[1], DESIRED_WIDTH, DESIRED_HEIGHT)
+            x, y = normalize(center[0], center[1],
+                             DESIRED_WIDTH, DESIRED_HEIGHT)  # Normalize
             send_packet(x, y, 1)  # Send to Arduino
-            cv2.circle(crop, center, 6, (0, 255, 0), -1)  # Draw detection circle
+            detected_flag = 1
+
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] x={x:+.3f}, y={y:+.3f}")  # Print info
         else:
             x, y = 0.0, 0.0
-            send_packet(x, y, 0)  # No ball detected
+            send_packet(0.0, 0.0, 0)  # No ball detected
+            detected_flag = 0
+            if frame_idx % PRINT_EVERY == 0:
+                print(f"[Frame {frame_idx}] Ball NOT detected")
 
-        # Overlay coordinates on image (top-left)
-        coord_text = f"X: {x:.3f} Y: {y:.3f}" if center else "Ball NOT detected"
-        cv2.putText(crop, coord_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 0, 255), 2)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        writer.writerow([timestamp, x, y, detected_flag])
 
-        # Calculate and overlay FPS
-        elapsed = time.time() - fps_start
-        fps = fps_counter / elapsed if elapsed > 0 else 0.0
-        cv2.putText(crop, f"FPS: {fps:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (255, 0, 0), 2)
+        # ----- create SAME mask view as first code -----
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask = cv2.threshold(blur, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+        mask = cv2.erode(mask, None, 1)
+        mask = cv2.dilate(mask, None, 2)
 
-        cv2.imshow("Camera View (Latency & Coordinates)", crop)  # Show crop
-        if cv2.waitKey(1) & 0xFF in (27, ord('q')):  # Exit on ESC or 'q'
+        display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+        if center:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                c = max(contours, key=cv2.contourArea)
+                ((_, _), r) = cv2.minEnclosingCircle(c)
+                cv2.circle(display, center, int(r), (0, 255, 0), 2)  # big circle
+                cv2.circle(display, center, 3, (0, 0, 255), -1)      # center dot
+
+        cv2.imshow("Camera View", display)
+        # ----------------------------------------------
+
+        if cv2.waitKey(1) & 0xFF in (27, ord('q')):
             break
 
-        # Print stats every PRINT_EVERY frames
-        if frame_idx % PRINT_EVERY == 0:
-            print(f"[Frame {frame_idx}] FPS: {fps:.2f}, Ball: {'Yes' if center else 'No'}, "
-                  f"X: {x if center else 0:.3f}, Y: {y if center else 0:.3f}")
-            fps_start = time.time()  # Reset FPS timer
-            fps_counter = 0  # Reset FPS counter
 
 finally:
     camera.StopGrabbing()
@@ -150,3 +175,4 @@ finally:
     if arduino and arduino.is_open:
         arduino.close()
     cv2.destroyAllWindows()  # Close OpenCV windows
+    log_file.close()

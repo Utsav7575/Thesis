@@ -1,12 +1,9 @@
 """
-ball_tracker_thesis.py
-Thesis-ready real-time ball tracking:
 - Basler pylon camera
 - MOSSE tracker with periodic full-detection reinit
-- Kalman filter for smoothing and latency prediction
+- Kalman filter for smoothing
 - Single display window showing mask + ball + center dot
 - FPS & processing stats printed in terminal
-- Sampling time consistent; placeholders for camera calibration
 """
 
 import cv2
@@ -17,6 +14,7 @@ import serial
 import time
 from collections import deque
 import csv
+from datetime import datetime
 
 # ---------- CONFIG ----------
 ARDUINO_PORT = 'COM3'       # Arduino port
@@ -40,10 +38,10 @@ try:
     time.sleep(2.0)  # allow Arduino reset
     arduino.flushInput()
     arduino.flushOutput()
-    print(f"[THESIS] Serial open {ARDUINO_PORT} @ {BAUD_RATE}")
+    print(f"Serial open {ARDUINO_PORT} @ {BAUD_RATE}")
 except Exception as e:
     arduino = None
-    print(f"[THESIS] Warning: serial open failed: {e}")
+    print(f"Warning: serial open failed: {e}")
 
 # ---------- CAMERA INIT ----------
 tl_factory = pylon.TlFactory.GetInstance()
@@ -61,7 +59,7 @@ converter.OutputPixelFormat = pylon.PixelType_BGR8packed
 converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 frame_w = camera.Width.Value
 frame_h = camera.Height.Value
-print(f"[THESIS] Camera initialized {frame_w}x{frame_h}")
+print(f"Camera initialized {frame_w}x{frame_h}")
 
 # ---------- KALMAN FILTER SETUP ----------
 kf = cv2.KalmanFilter(4,2)
@@ -81,11 +79,6 @@ tracker_initialized = False
 frame_idx = 0
 proc_times = deque(maxlen=PROCESS_TIME_WINDOW)
 serial_times = deque(maxlen=SERIAL_TIME_WINDOW)
-
-# ---------- CAMERA CALIBRATION PLACEHOLDER ----------
-# Replace with actual calibration matrix if real-world mapping needed
-camera_matrix = np.eye(3)
-dist_coeffs = np.zeros(5)
 
 # ---------- UTILS ----------
 def detect_ball(crop):
@@ -120,22 +113,22 @@ def send_packet(xc,yc,detected):
     try:
         arduino.write(packet)
     except Exception as e:
-        print(f"[THESIS] Serial write error: {e}")
+        print(f"Serial write error: {e}")
     serial_times.append(time.perf_counter()-t0)
 
 
-log_file = open("log_kalman.csv", "w", newline="") # for kalman code
-
+log_file = open("ball_tracker_with_kalman_filter.csv", "w", newline="") # for kalman code
 writer = csv.writer(log_file)
-writer.writerow(["time", "x", "y", "detected"])
-
+writer.writerow(["timestamp", "x_norm", "y_norm", "detected"])
 
 # ---------- MAIN LOOP ----------
 fps_start = time.time()
 while camera.IsGrabbing():
     t0 = time.perf_counter()
     grab = camera.RetrieveResult(3000, pylon.TimeoutHandling_ThrowException)
-    if not grab.GrabSucceeded(): grab.Release(); continue
+    if not grab.GrabSucceeded(): 
+        grab.Release()
+        continue
     img = converter.Convert(grab)
     frame = img.GetArray()
     grab.Release()
@@ -165,7 +158,8 @@ while camera.IsGrabbing():
                 bbox = (center[0]-radius,center[1]-radius,radius*2,radius*2)
                 tracker.init(cropped,bbox)
                 tracker_initialized=True
-            except: tracker_initialized=False
+            except: 
+                tracker_initialized=False
     else:
         if tracker_initialized and tracker is not None:
             ok,bbox = tracker.update(cropped)
@@ -196,10 +190,9 @@ while camera.IsGrabbing():
 
         x_centered,y_centered = center_coords_to_normalized((x_pred,y_pred),DESIRED_WIDTH,DESIRED_HEIGHT)
         send_packet(x_centered,y_centered,True)
-        
-        writer.writerow([time.time(), x_centered, y_centered, 1])
-        writer.writerow([time.time(), 0.0, 0.0, 0])
 
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        writer.writerow([timestamp, x_centered, y_centered, 1])
 
         # draw ball and center dot
         display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
@@ -212,10 +205,14 @@ while camera.IsGrabbing():
         display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
         cv2.putText(display,"Ball NOT detected",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
 
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        writer.writerow([timestamp, 0.0, 0.0, 0])
+
     # show single window
-    cv2.imshow("Ball Tracker (Mask View)",display)
+    cv2.imshow("Camera View",display)
     key = cv2.waitKey(1) & 0xFF
-    if key in (ord('q'),27): break
+    if key in (ord('q'),27): 
+        break
 
     # print FPS & coordinates
     if frame_idx % PRINT_EVERY==0:
@@ -228,7 +225,8 @@ while camera.IsGrabbing():
 # ---------- CLEANUP ----------
 camera.StopGrabbing()
 camera.Close()
-if arduino is not None and arduino.is_open: arduino.close()
+if arduino is not None and arduino.is_open: 
+    arduino.close()
 cv2.destroyAllWindows()
-print("[PY] Exiting")
+print("Exiting")
 log_file.close()
