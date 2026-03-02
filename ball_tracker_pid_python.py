@@ -55,8 +55,6 @@ I_CLAMP = 50                  # integral clamp
 SETPOINT_X = 0.0
 SETPOINT_Y = 0.0
 
-UPDATE_INTERVAL = 0.02        # ~50 Hz servo/PID update
-
 # ---------- PID STATE ----------
 error_x = error_y = 0.0
 last_error_x = last_error_y = 0.0
@@ -68,8 +66,6 @@ current_servo_x = SERVO_X_OFFSET
 current_servo_y = SERVO_Y_OFFSET
 target_servo_x = SERVO_X_OFFSET
 target_servo_y = SERVO_Y_OFFSET
-
-last_update_time = time.time()
 
 # ---------- SERIAL PACKET: send servo angles only ----------
 # 3-byte packet: uint8 servo_x, uint8 servo_y, uint8 detected_flag
@@ -131,8 +127,8 @@ def detect_ball(img):
 
 
 def normalize(cx, cy, w, h):
-    # returns [-1,1] coords (0,0) at image center
     return (cx - w / 2) / (w / 2), (cy - h / 2) / (h / 2)
+
 
 def pid_step(meas_x, meas_y, ball_detected):
     global error_x, error_y
@@ -142,7 +138,6 @@ def pid_step(meas_x, meas_y, ball_detected):
     global target_servo_x, target_servo_y
     global current_servo_x, current_servo_y
 
-    # --- if no ball: drive servos back to center and reset PID ---
     if not ball_detected:
         integral_x = integral_y = 0.0
         last_error_x = last_error_y = 0.0
@@ -150,7 +145,6 @@ def pid_step(meas_x, meas_y, ball_detected):
         target_servo_x = SERVO_X_OFFSET
         target_servo_y = SERVO_Y_OFFSET
     else:
-        # error = setpoint - measurement; adjust sign to match mechanics
         error_x = (SETPOINT_X - meas_x) * 1.2
         error_y = -(SETPOINT_Y - meas_y) * 1.2
 
@@ -162,7 +156,6 @@ def pid_step(meas_x, meas_y, ball_detected):
         integral_x += error_x
         integral_y += error_y
 
-        # clamp integral
         integral_x = max(-I_CLAMP, min(I_CLAMP, integral_x))
         integral_y = max(-I_CLAMP, min(I_CLAMP, integral_y))
 
@@ -175,15 +168,12 @@ def pid_step(meas_x, meas_y, ball_detected):
         last_error_x = error_x
         last_error_y = error_y
 
-        # convert PID output to servo target
         target_servo_x = SERVO_X_OFFSET + output_x
         target_servo_y = SERVO_Y_OFFSET + output_y
 
-        # respect servo limits
         target_servo_x = max(SERVO_MIN, min(SERVO_MAX, target_servo_x))
         target_servo_y = max(SERVO_MIN, min(SERVO_MAX, target_servo_y))
 
-    # smooth motion: rate limit from current_servo_* to target_servo_*
     if current_servo_x < target_servo_x:
         current_servo_x = min(current_servo_x + MAX_SERVO_CHANGE, target_servo_x)
     elif current_servo_x > target_servo_x:
@@ -194,7 +184,6 @@ def pid_step(meas_x, meas_y, ball_detected):
     elif current_servo_y > target_servo_y:
         current_servo_y = max(current_servo_y - MAX_SERVO_CHANGE, target_servo_y)
 
-    # final clamp
     current_servo_x = max(SERVO_MIN, min(SERVO_MAX, current_servo_x))
     current_servo_y = max(SERVO_MIN, min(SERVO_MAX, current_servo_y))
 
@@ -207,7 +196,7 @@ writer.writerow(["timestamp", "ball_x_norm", "ball_y_norm", "servo_x", "servo_y"
 
 # ---------- MAIN LOOP ----------
 frame_idx = 0
-last_pid_update = time.time()
+last_send_time = time.time()
 ball_detected = False
 meas_x = 0.0
 meas_y = 0.0
@@ -243,15 +232,14 @@ try:
             if frame_idx % PRINT_EVERY == 0:
                 print(f"[Frame {frame_idx}] Ball NOT detected")
 
-        # run PID at fixed interval
+        # ---- PID always updates every frame, but send/log at fixed 20ms ----
+        servo_x, servo_y = pid_step(meas_x, meas_y, ball_detected)
+
         now = time.time()
-        if now - last_pid_update >= UPDATE_INTERVAL:
-            servo_x, servo_y = pid_step(meas_x, meas_y, ball_detected)
+        if now - last_send_time >= 0.02:
             send_servo_packet(servo_x, servo_y, ball_detected)
-            last_pid_update = now
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-
             writer.writerow([
                 timestamp,
                 meas_x,
@@ -260,8 +248,9 @@ try:
                 servo_y,
                 int(ball_detected)
             ])
+            last_send_time = now
 
-        # ---- same mask visualization as code 1 (black background) ----
+        # ---- visualization ----
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         _, mask = cv2.threshold(blur, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
@@ -275,15 +264,13 @@ try:
             if contours:
                 c = max(contours, key=cv2.contourArea)
                 ((_, _), r) = cv2.minEnclosingCircle(c)
-                cv2.circle(display, (cx, cy), int(r), (0, 255, 0), 2)  # outer circle
-                cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)      # center dot
+                cv2.circle(display, (cx, cy), int(r), (0, 255, 0), 2)
+                cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)
 
         cv2.imshow("Camera View (PID in Python)", display)
-        # -------------------------------------------------------------
 
         if cv2.waitKey(1) & 0xFF in (27, ord('q')):
             break
-
 
 finally:
     camera.StopGrabbing()

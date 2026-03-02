@@ -3,6 +3,7 @@
 - MOSSE tracker with periodic full-detection reinit
 - Kalman filter for smoothing
 - Single display window showing mask + ball + center dot
+- Fixed 20ms packet send to Arduino
 - FPS & processing stats printed in terminal
 """
 
@@ -30,6 +31,7 @@ ARDUINO_EXTRA_LATENCY = 0.02 # extra seconds for Arduino + actuation
 PROCESS_TIME_WINDOW = 20     # rolling window for processing time
 SERIAL_TIME_WINDOW = 50      # rolling window for serial time
 PRINT_EVERY = 60             # print every N frames
+SEND_INTERVAL = 0.02         # 20 ms send interval
 # --------------------------------
 
 # ---------- SERIAL INIT ----------
@@ -116,13 +118,14 @@ def send_packet(xc,yc,detected):
         print(f"Serial write error: {e}")
     serial_times.append(time.perf_counter()-t0)
 
-
 log_file = open("ball_tracker_with_kalman_filter.csv", "w", newline="") # for kalman code
 writer = csv.writer(log_file)
 writer.writerow(["timestamp", "x_norm", "y_norm", "detected"])
 
 # ---------- MAIN LOOP ----------
 fps_start = time.time()
+last_send_time = time.perf_counter()  # track last 20ms send
+
 while camera.IsGrabbing():
     t0 = time.perf_counter()
     grab = camera.RetrieveResult(3000, pylon.TimeoutHandling_ThrowException)
@@ -172,7 +175,7 @@ while camera.IsGrabbing():
 
     proc_times.append(time.perf_counter()-t0)
 
-    # Kalman prediction and send packet
+    # Kalman prediction
     if center:
         meas = np.array([[np.float32(center[0])],[np.float32(center[1])]])
         kf.correct(meas)
@@ -189,26 +192,29 @@ while camera.IsGrabbing():
         y_pred = max(0,min(DESIRED_HEIGHT-1,y_pred))
 
         x_centered,y_centered = center_coords_to_normalized((x_pred,y_pred),DESIRED_WIDTH,DESIRED_HEIGHT)
-        send_packet(x_centered,y_centered,True)
 
+    else:
+        x_centered = 0.0
+        y_centered = 0.0
+
+    # ----------------- Send coordinates at fixed 20ms interval -----------------
+    now = time.perf_counter()
+    if now - last_send_time >= SEND_INTERVAL:
+        send_packet(x_centered, y_centered, center is not None)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        writer.writerow([timestamp, x_centered, y_centered, 1])
+        writer.writerow([timestamp, x_centered, y_centered, 1 if center else 0])
+        last_send_time = now
 
-        # draw ball and center dot
-        display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
+    # ----------------- Display -----------------
+    display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
+    if center:
         cv2.circle(display,center,radius,(0,255,0),2)
         cv2.circle(display,center,3,(0,0,255),-1)
         cv2.putText(display,f"X:{x_centered:+.3f} Y:{y_centered:+.3f}",(10,30),
                     cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
     else:
-        send_packet(0.0,0.0,False)
-        display = cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
         cv2.putText(display,"Ball NOT detected",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        writer.writerow([timestamp, 0.0, 0.0, 0])
-
-    # show single window
     cv2.imshow("Camera View",display)
     key = cv2.waitKey(1) & 0xFF
     if key in (ord('q'),27): 
@@ -217,9 +223,9 @@ while camera.IsGrabbing():
     # print FPS & coordinates
     if frame_idx % PRINT_EVERY==0:
         fps = PRINT_EVERY / (time.time()-fps_start)
-        print(f"[Frame {frame_idx}] FPS: {fps:.2f} | "
+        print(# f"[Frame {frame_idx}] FPS: {fps:.2f} | "
               f"{'Ball detected' if center else 'Lost'} | "
-              f"X:{x_centered if center else 0:+.3f} Y:{y_centered if center else 0:+.3f}")
+              f"X:{x_centered:+.3f} Y:{y_centered:+.3f}")
         fps_start = time.time()
 
 # ---------- CLEANUP ----------
