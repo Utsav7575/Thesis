@@ -1,0 +1,4 @@
+{
+  "caption": "Architecture C: ball_x_norm & ball_y_norm vs time (detected only)",
+  "description": "Only frames where detected == 1 from PID log."
+}

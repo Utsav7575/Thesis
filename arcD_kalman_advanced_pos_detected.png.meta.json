@@ -1,0 +1,4 @@
+{
+  "caption": "Architecture D: x_norm & y_norm vs time (detected only)",
+  "description": "Only frames where detected == 1."
+}

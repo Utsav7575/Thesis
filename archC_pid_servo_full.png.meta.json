@@ -1,0 +1,4 @@
+{
+  "caption": "Architecture C: servo_x & servo_y vs time (all rows)",
+  "description": "Servo commands over time including detected=0 rows."
+}

@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 files = {
     'A_simple': 'archA_simple_processed.csv',
     'B_kalman': 'archB_kalman_processed.csv',
-    'C_pid': 'archC_pid_processed.csv'
+    'C_pid': 'archC_pid_processed.csv',
+    'D_advanced': 'arcD_kalman_advanced_processed.csv'
 }
 
 common = {}
@@ -48,6 +49,7 @@ for k, df in common.items():
     win = max(1,int(0.5/dt))
     e_roll = pd.Series(e).rolling(win,min_periods=1).mean()
     plt.plot(dfv['t_s'], e_roll, label=k)
+
 plt.xlabel("Time (s)")
 plt.ylabel("|e| (norm units)")
 plt.title("Tracking error over time (rolling mean)")
@@ -59,21 +61,27 @@ plt.close()
 
 # ---------- X/Y OVER TIME ----------
 fig, axs = plt.subplots(2,1, figsize=(12,8), sharex=True)
+
 for k, df in common.items():
     dfv = df[df['detected']>0]
     if 'x_norm' not in dfv.columns or 'y_norm' not in dfv.columns:
         continue
     axs[0].plot(dfv['t_s'], dfv['x_norm'], label=k)
     axs[1].plot(dfv['t_s'], dfv['y_norm'], label=k)
+
 axs[0].axhline(0,color='k',alpha=0.5)
 axs[1].axhline(0,color='k',alpha=0.5)
+
 axs[0].set_ylabel('x_norm')
 axs[1].set_ylabel('y_norm')
 axs[1].set_xlabel('Time (s)')
+
 axs[0].set_title('Ball position vs time')
 axs[0].legend()
+
 for ax in axs:
     ax.grid(True,alpha=0.3)
+
 plt.tight_layout()
 plt.savefig("xy_over_time.png", dpi=200)
 plt.close()

@@ -1,0 +1,4 @@
+{
+  "caption": "Architecture B: x_norm & y_norm vs time (all rows)",
+  "description": "Includes detected=0 rows from Kalman-filter."
+}

@@ -126,7 +126,7 @@ void updateServoControl() {
   }
 
   // --- PID calculations ---
-  error_x = -ball_x * 1.2;  // adjust sign if needed
+  error_x = -ball_x * 1.2;
   error_y = ball_y * 1.2;
 
   if (abs(error_x) < deadzone) error_x = 0;
